@@ -289,6 +289,108 @@ class MicroChild(Model):
 
         with tf.variable_scope(self.name, reuse=reuse):
             # the first two inputs
+            x = self.initial_conv(images[:, :3, :, :], reuse, is_training)
+            layers = [x, x]
+
+            x = self.model_img_branch(layers, is_training)
+
+            x = tf.nn.elu(x)
+            x = global_max_pool(x, data_format=self.data_format)
+            if is_training and self.keep_prob is not None and self.keep_prob < 1.0:
+                x = tf.nn.dropout(x, self.keep_prob)
+            with tf.variable_scope("fc"):
+                inp_c = x.get_shape()[1]
+                # print("inp_c--------------",inp_c)
+                # print("shape x model --------------", x.shape)
+                w = create_weight("w", [inp_c, self.num_classes])
+                x = tf.matmul(x, w)
+        return x
+
+    def model_img_branch(self, layers, is_training):
+        # building layers in the micro space
+        out_filters = self.out_filters
+        for layer_id in range(self.num_layers + 2):
+            with tf.variable_scope("layer_{0}".format(layer_id)):
+                if layer_id not in self.pool_layers:
+                    if self.fixed_arc is None:
+                        x = self._enas_layer(
+                                layer_id, layers, self.normal_arc, out_filters,
+                                is_training=is_training)
+                    else:
+                        x = self._fixed_layer(
+                            layer_id, layers, self.normal_arc, out_filters,
+                            1, is_training=is_training,
+                            normal_or_reduction_cell="normal")
+                else:
+                    out_filters *= 2
+                    if self.fixed_arc is None:
+                        x = self._factorized_reduction(
+                            x, out_filters, 2, is_training)
+                        layers = [layers[-1], x]
+                        x = self._enas_layer(
+                            layer_id, layers, self.reduce_arc, out_filters,
+                            is_training=is_training)
+                    else:
+                        x = self._fixed_layer(
+                            layer_id, layers, self.reduce_arc, out_filters,
+                            2, is_training=is_training,
+                            normal_or_reduction_cell="reduction")
+                print("Layer {0:>2d}: {1}".format(layer_id, x))
+                layers = [layers[-1], x]
+
+            self.aux_heads(layer_id, is_training, x)
+        return x, out_filters
+
+    def aux_heads(self, layer_id, is_training, x):
+        # auxiliary heads
+        self.num_aux_vars = 0
+        if (self.use_aux_heads and
+            layer_id in self.aux_head_indices
+                and is_training):
+            print("Using aux_head at layer {0}".format(layer_id))
+            with tf.variable_scope("aux_head"):
+                aux_logits = tf.nn.elu(x)
+                aux_logits = tf.layers.average_pooling2d(
+                    aux_logits, [5, 5], [3, 3], "VALID",
+                    data_format=self.actual_data_format)
+                with tf.variable_scope("proj"):
+                    inp_c = self._get_C(aux_logits)
+                    w = create_weight("w", [1, 1, inp_c, 128])
+                    aux_logits = tf.nn.conv2d(aux_logits, w,
+                                              [1, 1, 1, 1], "SAME",
+                                              data_format=self.data_format)
+                    aux_logits = norm(aux_logits,
+                                      is_training=is_training,
+                                      data_format=self.data_format)
+                    aux_logits = tf.nn.elu(aux_logits)
+
+                with tf.variable_scope("avg_pool"):
+                    inp_c = self._get_C(aux_logits)
+                    hw = self._get_HW(aux_logits)
+                    w = create_weight("w", [hw, hw, inp_c, 768])
+                    aux_logits = tf.nn.conv2d(aux_logits, w, [1, 1, 1, 1], "SAME",
+                                              data_format=self.data_format)
+                    aux_logits = norm(aux_logits,  is_training=is_training,
+                                      data_format=self.data_format)
+                    aux_logits = tf.nn.elu(aux_logits)
+
+                with tf.variable_scope("fc"):
+                    aux_logits = global_max_pool(aux_logits,
+                                                 data_format=self.data_format)
+                    inp_c = aux_logits.get_shape()[1].value
+                    w = create_weight("w", [inp_c, self.num_classes])
+                    aux_logits = tf.matmul(aux_logits, w)
+                    self.aux_logits = aux_logits
+
+            aux_head_variables = [
+                var for var in tf.trainable_variables() if (
+                    var.name.startswith(self.name) and "aux_head" in var.name)]
+            self.num_aux_vars = count_model_params(aux_head_variables)
+            print("Aux head uses {0} params".format(self.num_aux_vars))
+
+    def initial_conv(self, images, reuse, is_training):
+        with tf.variable_scope('initial_conv', reuse=reuse):
+            # the first two inputs
             input_channels = self._get_C(images)
             print("channels--------------------------", input_channels)
             with tf.variable_scope("stem_conv"):
@@ -306,95 +408,6 @@ class MicroChild(Model):
             else:
                 raise ValueError(
                     "Unknown data_format '{0}'".format(self.data_format))
-            layers = [x, x]
-
-            # building layers in the micro space
-            out_filters = self.out_filters
-            for layer_id in range(self.num_layers + 2):
-                with tf.variable_scope("layer_{0}".format(layer_id)):
-                    if layer_id not in self.pool_layers:
-                        if self.fixed_arc is None:
-                            x = self._enas_layer(
-                                    layer_id, layers, self.normal_arc, out_filters,
-                                    is_training=is_training)
-                        else:
-                            x = self._fixed_layer(
-                                layer_id, layers, self.normal_arc, out_filters,
-                                1, is_training=is_training,
-                                normal_or_reduction_cell="normal")
-                    else:
-                        out_filters *= 2
-                        if self.fixed_arc is None:
-                            x = self._factorized_reduction(
-                                x, out_filters, 2, is_training)
-                            layers = [layers[-1], x]
-                            x = self._enas_layer(
-                                layer_id, layers, self.reduce_arc, out_filters,
-                                is_training=is_training)
-                        else:
-                            x = self._fixed_layer(
-                                layer_id, layers, self.reduce_arc, out_filters,
-                                2, is_training=is_training,
-                                normal_or_reduction_cell="reduction")
-                    print("Layer {0:>2d}: {1}".format(layer_id, x))
-                    layers = [layers[-1], x]
-
-                # auxiliary heads
-                self.num_aux_vars = 0
-                if (self.use_aux_heads and
-                    layer_id in self.aux_head_indices
-                        and is_training):
-                    print("Using aux_head at layer {0}".format(layer_id))
-                    with tf.variable_scope("aux_head"):
-                        aux_logits = tf.nn.elu(x)
-                        aux_logits = tf.layers.average_pooling2d(
-                            aux_logits, [5, 5], [3, 3], "VALID",
-                            data_format=self.actual_data_format)
-                        with tf.variable_scope("proj"):
-                            inp_c = self._get_C(aux_logits)
-                            w = create_weight("w", [1, 1, inp_c, 128])
-                            aux_logits = tf.nn.conv2d(aux_logits, w,
-                                                      [1, 1, 1, 1], "SAME",
-                                                      data_format=self.data_format)
-                            aux_logits = norm(aux_logits,
-                                              is_training=is_training,
-                                              data_format=self.data_format)
-                            aux_logits = tf.nn.elu(aux_logits)
-
-                        with tf.variable_scope("avg_pool"):
-                            inp_c = self._get_C(aux_logits)
-                            hw = self._get_HW(aux_logits)
-                            w = create_weight("w", [hw, hw, inp_c, 768])
-                            aux_logits = tf.nn.conv2d(aux_logits, w, [1, 1, 1, 1], "SAME",
-                                                      data_format=self.data_format)
-                            aux_logits = norm(aux_logits,  is_training=is_training,
-                                              data_format=self.data_format)
-                            aux_logits = tf.nn.elu(aux_logits)
-
-                        with tf.variable_scope("fc"):
-                            aux_logits = global_max_pool(aux_logits,
-                                                         data_format=self.data_format)
-                            inp_c = aux_logits.get_shape()[1].value
-                            w = create_weight("w", [inp_c, self.num_classes])
-                            aux_logits = tf.matmul(aux_logits, w)
-                            self.aux_logits = aux_logits
-
-                    aux_head_variables = [
-                        var for var in tf.trainable_variables() if (
-                            var.name.startswith(self.name) and "aux_head" in var.name)]
-                    self.num_aux_vars = count_model_params(aux_head_variables)
-                    print("Aux head uses {0} params".format(self.num_aux_vars))
-
-            x = tf.nn.elu(x)
-            x = global_max_pool(x, data_format=self.data_format)
-            if is_training and self.keep_prob is not None and self.keep_prob < 1.0:
-                x = tf.nn.dropout(x, self.keep_prob)
-            with tf.variable_scope("fc"):
-                inp_c = x.get_shape()[1]
-                # print("inp_c--------------",inp_c)
-                # print("shape x model --------------", x.shape)
-                w = create_weight("w", [inp_c, self.num_classes])
-                x = tf.matmul(x, w)
         return x
 
     def _fixed_conv(self, x, f_size, out_filters, stride, is_training,
